@@ -529,18 +529,34 @@ const SupabaseStore = {
     if(!r.ok) throw new Error('Supabase set ' + r.status);
     return {key, value};
   },
-  // busca todas as chaves que começam com o prefixo (paginado de 1000 em 1000)
-  async getMany(prefix){
-    const out = {};
+  // Cache local: { chave: {ts, dados} }. A cada sincronização baixa só
+  // chave + data de atualização (poucos bytes) e busca o conteúdo apenas
+  // das linhas que mudaram — economiza a franquia de tráfego do Supabase.
+  _cache: {},
+  async _fetchRows(query){
+    const out = [];
     const pageSize = 1000;
     for(let from = 0; ; from += pageSize){
-      const r = await fetch(this._base() + '?select=chave,dados&chave=like.' + encodeURIComponent(prefix + '*') + '&order=chave',
+      const r = await fetch(this._base() + query,
         {headers:this._headers({'Range-Unit':'items', 'Range': from + '-' + (from + pageSize - 1)})});
-      if(!r.ok) throw new Error('Supabase getMany ' + r.status);
+      if(!r.ok) throw new Error('Supabase ' + r.status);
       const rows = await r.json();
-      rows.forEach(v => { out[v.chave] = v.dados; });
+      out.push.apply(out, rows);
       if(rows.length < pageSize) break;
     }
+    return out;
+  },
+  async getMany(prefix){
+    const like = 'chave=like.' + encodeURIComponent(prefix + '*');
+    const index = await this._fetchRows('?select=chave,atualizado_em&' + like + '&order=chave');
+    const stale = index.filter(r => !this._cache[r.chave] || this._cache[r.chave].ts !== r.atualizado_em).map(r => r.chave);
+    for(let i = 0; i < stale.length; i += 50){
+      const chunk = stale.slice(i, i + 50).map(k => '"' + k.replace(/"/g, '') + '"').join(',');
+      const rows = await this._fetchRows('?select=chave,dados,atualizado_em&chave=in.(' + encodeURIComponent(chunk) + ')');
+      rows.forEach(r => { this._cache[r.chave] = {ts:r.atualizado_em, dados:r.dados}; });
+    }
+    const out = {};
+    index.forEach(r => { if(this._cache[r.chave]) out[r.chave] = this._cache[r.chave].dados; });
     return out;
   },
   async list(prefix){ return { keys: Object.keys(await this.getMany(prefix)) }; }
@@ -1445,6 +1461,7 @@ const ROLLOVER_CHECK_MS = 60000;
 // mudaram no servidor, preservando o que o usuário local está vendo.
 async function pollForUpdates(){
   if(state.modal) return; // não interrompe quem está lançando algo
+  if(document.hidden) return; // aba minimizada/em segundo plano: não consome tráfego
   try{
     const all = await Store.getMany(dayPrefix(state.date));
     let changed = false;
